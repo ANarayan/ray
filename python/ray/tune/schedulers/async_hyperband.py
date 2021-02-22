@@ -49,7 +49,8 @@ class AsyncHyperBandScheduler(FIFOScheduler):
                  max_t: int = 100,
                  grace_period: int = 1,
                  reduction_factor: float = 4,
-                 brackets: int = 1):
+                 brackets: int = 1,
+                 stop_last_trials: bool = False):
         assert max_t > 0, "Max (time_attr) not valid!"
         assert max_t >= grace_period, "grace_period must be <= max_t!"
         assert grace_period > 0, "grace_period must be positive!"
@@ -69,12 +70,13 @@ class AsyncHyperBandScheduler(FIFOScheduler):
         FIFOScheduler.__init__(self)
         self._reduction_factor = reduction_factor
         self._max_t = max_t
+        self._stop_last_trials = stop_last_trials
 
         self._trial_info = {}  # Stores Trial -> Bracket
 
         # Tracks state for new trial add
         self._brackets = [
-            _Bracket(grace_period, max_t, reduction_factor, s)
+            _Bracket(grace_period, max_t, reduction_factor, s, stop_last_trials)
             for s in range(brackets)
         ]
         self._counter = 0  # for
@@ -129,11 +131,14 @@ class AsyncHyperBandScheduler(FIFOScheduler):
 
     def on_trial_result(self, trial_runner: "trial_runner.TrialRunner",
                         trial: Trial, result: Dict) -> str:
+
         action = TrialScheduler.CONTINUE
         if self._time_attr not in result or self._metric not in result:
             return action
-        if result[self._time_attr] >= self._max_t:
+        if result[self._time_attr] >= self._max_t and self._stop_last_trials:
             action = TrialScheduler.STOP
+        elif result[self._time_attr] >= self._max_t and not self._stop_last_trials:
+            action = TrialScheduler.PAUSE
         else:
             bracket = self._trial_info[trial.trial_id]
             action = bracket.on_result(trial, result[self._time_attr],
@@ -150,6 +155,7 @@ class AsyncHyperBandScheduler(FIFOScheduler):
         bracket.on_result(trial, result[self._time_attr],
                           self._metric_op * result[self._metric])
         del self._trial_info[trial.trial_id]
+
 
     def on_trial_remove(self, trial_runner: "trial_runner.TrialRunner",
                         trial: Trial):
@@ -177,11 +183,12 @@ class _Bracket():
     """
 
     def __init__(self, min_t: int, max_t: int, reduction_factor: float,
-                 s: int):
+                 s: int, stop_last_trials: bool):
         self.rf = reduction_factor
         MAX_RUNGS = int(np.log(max_t / min_t) / np.log(self.rf) - s + 1)
         self._rungs = [(min_t * self.rf**(k + s), {})
                        for k in reversed(range(MAX_RUNGS))]
+        self.stop_last_trials = stop_last_trials
 
     def cutoff(self, recorded) -> Union[None, int, float, complex, np.ndarray]:
         if not recorded:
@@ -192,7 +199,7 @@ class _Bracket():
     def on_result(self, trial: Trial, cur_iter: int,
                   cur_rew: Optional[float]) -> str:
         action = TrialScheduler.CONTINUE
-        for milestone, recorded in self._rungs:
+        for idx, (milestone, recorded) in enumerate(self._rungs):
             if cur_iter < milestone or trial.trial_id in recorded:
                 continue
             else:
